@@ -1,41 +1,54 @@
-# Agentic Customer Support Associate with ReAct Loop
+# 🤖 Agentic Customer Support Associate
 
 ## Final Year Major Project
 
-An AI-powered customer support system that combines:
+An AI-powered customer support system that uses an **agentic architecture** to understand customer queries, retrieve relevant support information, interact with controlled backend tools, maintain conversational context, and provide transparent agent activity.
 
-- Large Language Models
+The system combines:
+
+- ReAct-style agent routing
 - Retrieval-Augmented Generation (RAG)
-- ReAct-based agent orchestration
-- Controlled tool/API execution
-- Human escalation
-- Guardrails and security
-- Conversation context
-- Agent execution logging
-- Performance evaluation
+- Semantic search
+- Conversation memory
+- Controlled backend tools
+- PostgreSQL database
+- Order management
+- Product search
+- Support ticket management
+- Knowledge-base policies
+- Agent activity tracing
+- React-based customer support interface
 
-## Technology Stack
+---
 
-### Frontend
-- React.js
+# 📌 Project Overview
 
-### Backend
-- Python
-- FastAPI
+Traditional customer-support systems usually depend on static FAQs or manually operated support dashboards.
 
-### AI
-- Large Language Model
-- RAG
-- Embeddings
-- ReAct Agent
+Our system provides an AI-powered support assistant that can:
 
-### Database
-- PostgreSQL
+1. Understand the customer's request.
+2. Determine what type of request it is.
+3. Check conversation memory.
+4. Select an appropriate controlled tool.
+5. Retrieve information from the database or knowledge base.
+6. Generate a response using the obtained information.
+7. Maintain context for follow-up questions.
+8. Display the agent's processing activity to the user.
 
-### Deployment
-- Docker
-- Docker Compose
+### Example
 
-## Project Status
+Customer:
 
-Phase 1 - Backend foundation
+> Where is my order ORD1002?
+
+The agent identifies this as an **order-status query** and calls the controlled order tool.
+
+Customer:
+
+> When will it arrive?
+
+Instead of treating this as a completely new question, the system uses conversation memory to remember:
+
+```text
+Previous order: ORD1002
