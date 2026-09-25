@@ -18,6 +18,8 @@ import {
   Eye,
   History,
   CircleUserRound,
+  LogOut,
+  ShieldCheck,
 } from "lucide-react";
 
 import "./App.css";
@@ -28,15 +30,51 @@ import "./App.css";
 
 const API_URL = "http://127.0.0.1:8000";
 
-const CUSTOMER_ID = 3;
+const ACCESS_TOKEN_KEY = "support_access_token";
+const SESSION_KEY_PREFIX = "support_session_";
 
-const SESSION_ID = "frontend-demo-session";
+const DEFAULT_MESSAGES = [
+  {
+    role: "assistant",
+    content:
+      "Hello! I'm your AI Customer Support Assistant. I can help you with orders, products, tickets, returns, refunds and support policies.",
+  },
+];
+
+const api = axios.create({
+  baseURL: API_URL,
+});
+
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem(ACCESS_TOKEN_KEY);
+
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+
+  return config;
+});
 
 // ============================================================
 // APPLICATION
 // ============================================================
 
 function App() {
+  // ==========================================================
+  // AUTHENTICATION
+  // ==========================================================
+
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(() =>
+    Boolean(localStorage.getItem(ACCESS_TOKEN_KEY))
+  );
+  const [loginForm, setLoginForm] = useState({
+    email: "",
+    password: "",
+  });
+  const [loginError, setLoginError] = useState("");
+  const [loginSubmitting, setLoginSubmitting] = useState(false);
+
   // ==========================================================
   // CURRENT PAGE
   // ==========================================================
@@ -82,13 +120,7 @@ function App() {
   // CHAT MESSAGES
   // ==========================================================
 
-  const [messages, setMessages] = useState([
-    {
-      role: "assistant",
-      content:
-        "Hello! I'm your AI Customer Support Assistant. I can help you with orders, products, tickets, returns, refunds and support policies.",
-    },
-  ]);
+  const [messages, setMessages] = useState(DEFAULT_MESSAGES);
 
   // ==========================================================
   // INPUT
@@ -129,19 +161,58 @@ function App() {
   });
 
   // ==========================================================
-  // FETCH ORDERS
+  // AUTHENTICATION BOOTSTRAP
   // ==========================================================
 
-  const fetchOrders = async () => {
-    setOrdersLoading(true);
-    setOrdersError("");
+  useEffect(() => {
+    const token = localStorage.getItem(ACCESS_TOKEN_KEY);
+
+    if (!token) {
+      return;
+    }
+
+    api
+      .get("/auth/me")
+      .then((response) => {
+        if (response.data?.success && response.data?.user) {
+          setCurrentUser(response.data.user);
+        } else {
+          localStorage.removeItem(ACCESS_TOKEN_KEY);
+        }
+      })
+      .catch((error) => {
+        console.error("Authentication bootstrap failed:", error);
+        localStorage.removeItem(ACCESS_TOKEN_KEY);
+      })
+      .finally(() => {
+        setAuthLoading(false);
+      });
+  }, []);
+
+  // ==========================================================
+  // LOGIN
+  // ==========================================================
+
+  const handleLogin = async (event) => {
+    event.preventDefault();
+
+    if (loginSubmitting) {
+      return;
+    }
+
+    setLoginError("");
+    setLoginSubmitting(true);
 
     try {
-      const response = await axios.get(
-        `${API_URL}/orders`,
+      const response = await axios.post(
+        `${API_URL}/auth/login`,
         {
-          params: {
-            customer_id: CUSTOMER_ID,
+          email: loginForm.email.trim(),
+          password: loginForm.password,
+        },
+        {
+          headers: {
+            "Content-Type": "application/json",
           },
           timeout: 10000,
         }
@@ -149,10 +220,126 @@ function App() {
 
       const data = response.data;
 
-      console.log("=================================");
-      console.log("ORDERS RESPONSE");
-      console.log(data);
-      console.log("=================================");
+      if (!data?.success || !data?.access_token || !data?.user) {
+        throw new Error("The server returned an invalid login response.");
+      }
+
+      localStorage.setItem(
+        ACCESS_TOKEN_KEY,
+        data.access_token
+      );
+
+      setCurrentUser(data.user);
+      setLoginForm({ email: "", password: "" });
+      setCurrentPage("support");
+      setMessages(DEFAULT_MESSAGES);
+      setActivity([
+        {
+          icon: <CheckCircle2 size={16} />,
+          text: "Authenticated successfully",
+          active: true,
+        },
+      ]);
+      setAgentInfo({
+        agent: "Waiting",
+        tool: "None",
+      });
+      setMemory({
+        enabled: true,
+        contextUsed: false,
+      });
+    } catch (error) {
+      console.error("Login failed:", error);
+
+      if (error.response?.status === 401) {
+        setLoginError("Invalid email or password.");
+      } else if (error.response?.data?.detail) {
+        setLoginError(error.response.data.detail);
+      } else if (error.request) {
+        setLoginError(
+          "Could not connect to the backend. Please make sure FastAPI is running on port 8000."
+        );
+      } else {
+        setLoginError("Unable to sign in. Please try again.");
+      }
+    } finally {
+      setLoginSubmitting(false);
+    }
+  };
+
+  // ==========================================================
+  // LOGOUT
+  // ==========================================================
+
+  const handleLogout = () => {
+    localStorage.removeItem(ACCESS_TOKEN_KEY);
+
+    if (currentUser?.id) {
+      localStorage.removeItem(
+        `${SESSION_KEY_PREFIX}${currentUser.id}`
+      );
+    }
+
+    setCurrentUser(null);
+    setCurrentPage("support");
+    setMessages(DEFAULT_MESSAGES);
+    setOrders([]);
+    setTickets([]);
+    setKnowledgeDocuments([]);
+    setDashboard(null);
+    setLoginError("");
+  };
+
+  // ==========================================================
+  // ROLE-BASED NAVIGATION
+  // ==========================================================
+
+  const canAccessPage = (page) => {
+    if (!currentUser) {
+      return false;
+    }
+
+    if (page === "dashboard") {
+      return ["support_agent", "admin"].includes(
+        currentUser.role
+      );
+    }
+
+    return ["support", "orders", "tickets", "knowledge"].includes(
+      page
+    );
+  };
+
+  const navigateTo = (page) => {
+    if (canAccessPage(page)) {
+      setCurrentPage(page);
+    }
+  };
+
+  // ==========================================================
+  // FETCH ORDERS
+  // ==========================================================
+
+  const fetchOrders = async () => {
+    if (!currentUser) {
+      return;
+    }
+
+    setOrdersLoading(true);
+    setOrdersError("");
+
+    try {
+      const params =
+        currentUser.role === "customer"
+          ? { customer_id: currentUser.id }
+          : {};
+
+      const response = await api.get("/orders", {
+        params,
+        timeout: 10000,
+      });
+
+      const data = response.data;
 
       if (data?.success) {
         setOrders(data.orders || []);
@@ -161,6 +348,11 @@ function App() {
       }
     } catch (error) {
       console.error("Orders request failed:", error);
+
+      if (error.response?.status === 401) {
+        handleLogout();
+        return;
+      }
 
       if (error.response) {
         setOrdersError(
@@ -185,26 +377,25 @@ function App() {
   // ==========================================================
 
   const fetchTickets = async () => {
+    if (!currentUser) {
+      return;
+    }
+
     setTicketsLoading(true);
     setTicketsError("");
 
     try {
-      const response = await axios.get(
-        `${API_URL}/tickets`,
-        {
-          params: {
-            customer_id: CUSTOMER_ID,
-          },
-          timeout: 10000,
-        }
-      );
+      const params =
+        currentUser.role === "customer"
+          ? { customer_id: currentUser.id }
+          : {};
+
+      const response = await api.get("/tickets", {
+        params,
+        timeout: 10000,
+      });
 
       const data = response.data;
-
-      console.log("=================================");
-      console.log("TICKETS RESPONSE");
-      console.log(data);
-      console.log("=================================");
 
       if (data?.success) {
         setTickets(data.tickets || []);
@@ -215,6 +406,11 @@ function App() {
       }
     } catch (error) {
       console.error("Tickets request failed:", error);
+
+      if (error.response?.status === 401) {
+        handleLogout();
+        return;
+      }
 
       if (error.response) {
         setTicketsError(
@@ -243,8 +439,8 @@ function App() {
     setKnowledgeError("");
 
     try {
-      const response = await axios.get(
-        `${API_URL}/knowledge-base`,
+      const response = await api.get(
+        "/knowledge-base",
         {
           timeout: 10000,
         }
@@ -300,8 +496,8 @@ function App() {
     setDashboardError("");
 
     try {
-      const response = await axios.get(
-        `${API_URL}/dashboard/stats`,
+      const response = await api.get(
+        "/dashboard/stats",
         {
           timeout: 10000,
         }
@@ -350,22 +546,36 @@ function App() {
   // ==========================================================
 
   useEffect(() => {
-    if (currentPage === "orders") {
-      fetchOrders();
+    if (!currentUser) {
+      return;
     }
 
-    if (currentPage === "tickets") {
-      fetchTickets();
-    }
+    const loadCurrentPage = async () => {
+      if (currentPage === "orders") {
+        await fetchOrders();
+      }
 
-    if (currentPage === "knowledge") {
-      fetchKnowledgeBase();
-    }
+      if (currentPage === "tickets") {
+        await fetchTickets();
+      }
 
-    if (currentPage === "dashboard") {
-      fetchDashboard();
-    }
-  }, [currentPage]);
+      if (currentPage === "knowledge") {
+        await fetchKnowledgeBase();
+      }
+
+      if (
+        currentPage === "dashboard" &&
+        ["support_agent", "admin"].includes(currentUser.role)
+      ) {
+        await fetchDashboard();
+      }
+    };
+
+    void loadCurrentPage();
+    // The page loader functions are intentionally kept stable at the
+    // component level because they update the corresponding page state.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentPage, currentUser]);
 
   // ==========================================================
   // FORMAT DATE
@@ -683,12 +893,22 @@ function App() {
     ]);
 
     try {
-      const response = await axios.post(
-        `${API_URL}/agent/query`,
+      const storageKey = `${SESSION_KEY_PREFIX}${currentUser.id}`;
+      const sessionId =
+        localStorage.getItem(storageKey) ||
+        `frontend-${currentUser.role}-${currentUser.id}-${Date.now()}`;
+
+      localStorage.setItem(storageKey, sessionId);
+
+      const response = await api.post(
+        "/agent/query",
         {
           query: userMessage,
-          customer_id: CUSTOMER_ID,
-          session_id: SESSION_ID,
+          customer_id:
+            currentUser.role === "customer"
+              ? currentUser.id
+              : null,
+          session_id: sessionId,
         },
         {
           headers: {
@@ -729,6 +949,11 @@ function App() {
         "Agent request failed:",
         error
       );
+
+      if (error.response?.status === 401) {
+        handleLogout();
+        return;
+      }
 
       let errorMessage =
         "Sorry, I couldn't connect to the support agent.";
@@ -846,8 +1071,137 @@ function App() {
   };
 
   // ==========================================================
+  // AUTHENTICATION SCREENS
+  // ==========================================================
+
+  if (authLoading) {
+    return (
+      <div className="auth-screen">
+        <div className="auth-card auth-loading-card">
+          <div className="auth-brand-mark">
+            <Bot size={24} />
+          </div>
+          <h1>SupportAI</h1>
+          <p>Checking your session...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return (
+      <div className="auth-screen">
+        <div className="auth-card">
+          <div className="auth-brand">
+            <div className="auth-brand-mark">
+              <Bot size={24} />
+            </div>
+            <div>
+              <h1>SupportAI</h1>
+              <span>Agentic Customer Support</span>
+            </div>
+          </div>
+
+          <div className="auth-heading">
+            <p className="eyebrow">SECURE ACCESS</p>
+            <h2>Sign in to your workspace</h2>
+            <p>
+              Use your account credentials to access the support
+              system according to your assigned role.
+            </p>
+          </div>
+
+          <form className="auth-form" onSubmit={handleLogin}>
+            <label>
+              Email
+              <input
+                type="email"
+                value={loginForm.email}
+                onChange={(event) =>
+                  setLoginForm((previous) => ({
+                    ...previous,
+                    email: event.target.value,
+                  }))
+                }
+                placeholder="you@example.com"
+                autoComplete="email"
+                required
+              />
+            </label>
+
+            <label>
+              Password
+              <input
+                type="password"
+                value={loginForm.password}
+                onChange={(event) =>
+                  setLoginForm((previous) => ({
+                    ...previous,
+                    password: event.target.value,
+                  }))
+                }
+                placeholder="Enter your password"
+                autoComplete="current-password"
+                required
+              />
+            </label>
+
+            {loginError && (
+              <div className="auth-error">
+                {loginError}
+              </div>
+            )}
+
+            <button
+              className="auth-submit"
+              type="submit"
+              disabled={
+                loginSubmitting ||
+                !loginForm.email.trim() ||
+                !loginForm.password
+              }
+            >
+              {loginSubmitting ? "Signing in..." : "Sign in"}
+            </button>
+          </form>
+
+          <div className="auth-security-note">
+            <ShieldCheck size={16} />
+            <span>
+              Access is protected by JWT authentication and role-based
+              permissions.
+            </span>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ==========================================================
   // UI
   // ==========================================================
+
+  const sessionStorageKey =
+    `${SESSION_KEY_PREFIX}${currentUser.id}`;
+  const currentSessionId =
+    localStorage.getItem(sessionStorageKey) ||
+    "Not started";
+
+  const initials = currentUser.name
+    ? currentUser.name
+        .split(" ")
+        .map((part) => part[0])
+        .join("")
+        .slice(0, 2)
+        .toUpperCase()
+    : currentUser.email.slice(0, 2).toUpperCase();
+
+  const roleLabel =
+    currentUser.role === "support_agent"
+      ? "Support Agent"
+      : currentUser.role === "admin"
+        ? "Administrator"
+        : "Customer";
 
   return (
     <div className="app-shell">
@@ -879,41 +1233,31 @@ function App() {
 
           <button
             className={`nav-item ${
-              currentPage === "support"
-                ? "active"
-                : ""
+              currentPage === "support" ? "active" : ""
             }`}
-            onClick={() =>
-              setCurrentPage("support")
-            }
+            onClick={() => navigateTo("support")}
           >
             <MessageSquare size={18} />
             AI Support
           </button>
 
-          <button
-            className={`nav-item ${
-              currentPage === "dashboard"
-                ? "active"
-                : ""
-            }`}
-            onClick={() =>
-              setCurrentPage("dashboard")
-            }
-          >
-            <LayoutDashboard size={18} />
-            Dashboard
-          </button>
+          {canAccessPage("dashboard") && (
+            <button
+              className={`nav-item ${
+                currentPage === "dashboard" ? "active" : ""
+              }`}
+              onClick={() => navigateTo("dashboard")}
+            >
+              <LayoutDashboard size={18} />
+              Dashboard
+            </button>
+          )}
 
           <button
             className={`nav-item ${
-              currentPage === "orders"
-                ? "active"
-                : ""
+              currentPage === "orders" ? "active" : ""
             }`}
-            onClick={() =>
-              setCurrentPage("orders")
-            }
+            onClick={() => navigateTo("orders")}
           >
             <Package size={18} />
             Orders
@@ -921,13 +1265,9 @@ function App() {
 
           <button
             className={`nav-item ${
-              currentPage === "tickets"
-                ? "active"
-                : ""
+              currentPage === "tickets" ? "active" : ""
             }`}
-            onClick={() =>
-              setCurrentPage("tickets")
-            }
+            onClick={() => navigateTo("tickets")}
           >
             <Ticket size={18} />
             Tickets
@@ -935,13 +1275,9 @@ function App() {
 
           <button
             className={`nav-item ${
-              currentPage === "knowledge"
-                ? "active"
-                : ""
+              currentPage === "knowledge" ? "active" : ""
             }`}
-            onClick={() =>
-              setCurrentPage("knowledge")
-            }
+            onClick={() => navigateTo("knowledge")}
           >
             <BookOpen size={18} />
             Knowledge Base
@@ -965,16 +1301,23 @@ function App() {
           <div className="profile">
 
             <div className="profile-avatar">
-              JD
+              {initials}
             </div>
 
-            <div>
-              <strong>Demo Customer</strong>
+            <div className="profile-details">
+              <strong>{currentUser.name}</strong>
 
-              <span>
-                Customer ID: {CUSTOMER_ID}
-              </span>
+              <span>{roleLabel}</span>
             </div>
+
+            <button
+              className="logout-button"
+              onClick={handleLogout}
+              title="Sign out"
+              aria-label="Sign out"
+            >
+              <LogOut size={15} />
+            </button>
 
           </div>
 
@@ -1021,7 +1364,7 @@ function App() {
             </div>
 
             <div className="avatar">
-              JD
+              {initials}
             </div>
 
           </div>
@@ -1111,7 +1454,7 @@ function App() {
                       {message.role === "user" && (
 
                         <div className="message-avatar user-message-avatar">
-                          JD
+                          {initials}
                         </div>
 
                       )}
@@ -1363,7 +1706,7 @@ function App() {
                 </div>
 
                 <small>
-                  Session: {SESSION_ID}
+                  Session: {currentSessionId}
                 </small>
 
               </div>
@@ -1390,12 +1733,15 @@ function App() {
                 </p>
 
                 <h3>
-                  Your Orders
+                  {currentUser.role === "customer"
+                    ? "Your Orders"
+                    : "Customer Orders"}
                 </h3>
 
                 <p>
-                  View your recent orders and delivery
-                  information.
+                  {currentUser.role === "customer"
+                    ? "View your recent orders and delivery information."
+                    : "View orders available to your support role."}
                 </p>
 
               </div>
@@ -1972,12 +2318,15 @@ function App() {
                 </p>
 
                 <h3>
-                  Your Support Tickets
+                  {currentUser.role === "customer"
+                    ? "Your Support Tickets"
+                    : "Support Tickets"}
                 </h3>
 
                 <p>
-                  View your support requests and their
-                  current status.
+                  {currentUser.role === "customer"
+                    ? "View your support requests and their current status."
+                    : "Review customer support requests and their current status."}
                 </p>
 
               </div>

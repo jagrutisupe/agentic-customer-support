@@ -1,28 +1,24 @@
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app.database.connection import engine, get_db
-
-from app.database.models import (
-    Order,
-    SupportTicket,
-    Product,
-    User,
-)
-
-from app.rag.loader import (
-    load_documents, 
-    load_and_chunk_documents,
-)
+from app.auth import create_access_token, hash_password, verify_password
+from app.dependencies import get_current_user, require_roles
 
 from app.database.models import (
     Order,
     OrderItem,
     Product,
     SupportTicket,
+    User,
+)
+
+from app.rag.loader import (
+    load_documents,
+    load_and_chunk_documents,
 )
 
 from app.tools.order_tools import get_order_status
@@ -38,11 +34,6 @@ from app.tools.ticket_tools import (
 )
 
 from app.rag.rag_tools import search_knowledge_base
-
-from app.rag.loader import (
-    load_documents,
-    load_and_chunk_documents,
-)
 
 from app.agent.router import route_query
 
@@ -110,11 +101,7 @@ def database_health_check():
 
     try:
         with engine.connect() as connection:
-
-            result = connection.execute(
-                text("SELECT 1")
-            )
-
+            result = connection.execute(text("SELECT 1"))
             value = result.scalar()
 
         return {
@@ -124,7 +111,6 @@ def database_health_check():
         }
 
     except Exception as error:
-
         return {
             "status": "error",
             "database": "connection_failed",
@@ -132,8 +118,174 @@ def database_health_check():
         }
 
 
+# ============================================================
+# AUTHENTICATION
+# ============================================================
+
+class RegisterRequest(BaseModel):
+    name: str
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+@app.post("/auth/register")
+def register(
+    request: RegisterRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Register a new customer account.
+
+    Public registration always creates a customer.
+    Users cannot register themselves as admin or support_agent.
+    """
+
+    email = request.email.strip().lower()
+    name = request.name.strip()
+
+    if not name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Name is required.",
+        )
+
+    if len(request.password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Password must be at least 8 characters long.",
+        )
+
+    existing_user = (
+        db.query(User)
+        .filter(User.email == email)
+        .first()
+    )
+
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email already exists.",
+        )
+
+    user = User(
+        name=name,
+        email=email,
+        password_hash=hash_password(request.password),
+        role="customer",
+        is_active=True,
+    )
+
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    token = create_access_token(
+        user.id,
+        user.role,
+    )
+
+    return {
+        "success": True,
+        "message": "Customer account created successfully.",
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": user.id,
+            "name": user.name,
+            "email": user.email,
+            "role": user.role,
+        },
+    }
+
+
+@app.post("/auth/login")
+def login(
+    request: LoginRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Authenticate a user and return a JWT access token.
+    """
+
+    email = request.email.strip().lower()
+
+    user = (
+        db.query(User)
+        .filter(User.email == email)
+        .first()
+    )
+
+    if (
+        not user
+        or not user.is_active
+        or not verify_password(
+            request.password,
+            user.password_hash,
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+            headers={
+                "WWW-Authenticate": "Bearer"
+            },
+        )
+
+    token = create_access_token(
+        user.id,
+        user.role,
+    )
+
+    return {
+        "success": True,
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {
+            "id": user.id,
+            "name": user.name,
+            "email": user.email,
+            "role": user.role,
+            "is_active": user.is_active,
+        },
+    }
+
+
+@app.get("/auth/me")
+def auth_me(
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Return the authenticated user's identity and role.
+    """
+
+    return {
+        "success": True,
+        "user": {
+            "id": current_user.id,
+            "name": current_user.name,
+            "email": current_user.email,
+            "role": current_user.role,
+            "is_active": current_user.is_active,
+        },
+    }
+
+
+# ============================================================
+# DASHBOARD STATS
+# ============================================================
+
 @app.get("/dashboard/stats")
-def dashboard_stats(db: Session = Depends(get_db)):
+def dashboard_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("support_agent", "admin")
+    ),
+):
     """
     Return live statistics for the dashboard.
     """
@@ -164,13 +316,9 @@ def dashboard_stats(db: Session = Depends(get_db)):
 # ============================================================
 
 class CreateTicketRequest(BaseModel):
-
     customer_id: int
-
     subject: str
-
     description: str
-
     priority: str = "medium"
 
 
@@ -182,12 +330,25 @@ class CreateTicketRequest(BaseModel):
 def order_status(
     order_number: str,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
 
-    return get_order_status(
+    result = get_order_status(
         db=db,
         order_number=order_number,
     )
+
+    if current_user.role == "customer" and result.get("success"):
+
+        order = result.get("order", {})
+
+        if order.get("customer_id") != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only access your own orders.",
+            )
+
+    return result
 
 
 # ============================================================
@@ -198,6 +359,7 @@ def order_status(
 def product_search(
     query: str,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
 
     return search_products(
@@ -214,6 +376,7 @@ def product_search(
 def product_details(
     product_id: int,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
 
     return get_product_details(
@@ -230,11 +393,42 @@ def product_details(
 def create_ticket(
     request: CreateTicketRequest,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    """
+    Create a support ticket.
+
+    SECURITY RULE:
+
+    Customer:
+        The customer_id from the request is completely ignored.
+        The ticket ALWAYS belongs to the authenticated customer.
+
+    Support Agent / Admin:
+        They may create a ticket for a specified customer_id.
+    """
+
+    if current_user.role == "customer":
+
+        # IMPORTANT:
+        # Never trust request.customer_id for a customer.
+        # Always use the authenticated JWT identity.
+        actual_customer_id = current_user.id
+
+    elif current_user.role in {"support_agent", "admin"}:
+
+        actual_customer_id = request.customer_id
+
+    else:
+
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to create support tickets.",
+        )
 
     return create_support_ticket(
         db=db,
-        customer_id=request.customer_id,
+        customer_id=actual_customer_id,
         subject=request.subject,
         description=request.description,
         priority=request.priority,
@@ -249,12 +443,25 @@ def create_ticket(
 def ticket_status(
     ticket_id: int,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
 
-    return get_ticket_status(
+    result = get_ticket_status(
         db=db,
         ticket_id=ticket_id,
     )
+
+    if current_user.role == "customer" and result.get("success"):
+
+        ticket = result.get("ticket", {})
+
+        if ticket.get("customer_id") != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You can only access your own tickets.",
+            )
+
+    return result
 
 
 # ============================================================
@@ -265,6 +472,7 @@ def ticket_status(
 def rag_search(
     query: str,
     top_k: int = 3,
+    current_user: User = Depends(get_current_user),
 ):
 
     return search_knowledge_base(
@@ -278,10 +486,11 @@ def rag_search(
 # ============================================================
 
 @app.get("/knowledge-base")
-def get_knowledge_base():
+def get_knowledge_base(
+    current_user: User = Depends(get_current_user),
+):
     """
-    Return all knowledge-base documents for the
-    Knowledge Base page.
+    Return all knowledge-base documents.
     """
 
     documents = load_documents()
@@ -336,11 +545,8 @@ def get_knowledge_base():
 # ============================================================
 
 class AgentQueryRequest(BaseModel):
-
     query: str
-
     customer_id: int | None = None
-
     session_id: str | None = None
 
 
@@ -352,12 +558,25 @@ class AgentQueryRequest(BaseModel):
 def agent_query(
     request: AgentQueryRequest,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    """
+    Main AI customer-support endpoint.
+
+    Customers are always bound to their authenticated user ID.
+    Support agents and admins may specify a customer ID.
+    """
+
+    if current_user.role == "customer":
+        actual_customer_id = current_user.id
+
+    else:
+        actual_customer_id = request.customer_id
 
     return route_query(
         db=db,
         query=request.query,
-        customer_id=request.customer_id,
+        customer_id=actual_customer_id,
         session_id=request.session_id,
     )
 
@@ -370,17 +589,27 @@ def agent_query(
 def get_orders(
     customer_id: int | None = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Return orders for the Orders page.
 
-    If customer_id is provided, only that customer's
-    orders are returned.
+    Customers can ONLY see their own orders.
+
+    Support agents and admins can optionally filter
+    orders by customer_id.
     """
 
     query = db.query(Order)
 
-    if customer_id is not None:
+    if current_user.role == "customer":
+
+        query = query.filter(
+            Order.customer_id == current_user.id
+        )
+
+    elif customer_id is not None:
+
         query = query.filter(
             Order.customer_id == customer_id
         )
@@ -460,17 +689,27 @@ def get_orders(
 def get_tickets(
     customer_id: int | None = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Return support tickets for the Tickets page.
 
-    If customer_id is provided, only that customer's
-    tickets are returned.
+    Customers can ONLY see their own tickets.
+
+    Support agents and admins can optionally filter
+    tickets by customer_id.
     """
 
     query = db.query(SupportTicket)
 
-    if customer_id is not None:
+    if current_user.role == "customer":
+
+        query = query.filter(
+            SupportTicket.customer_id == current_user.id
+        )
+
+    elif customer_id is not None:
+
         query = query.filter(
             SupportTicket.customer_id == customer_id
         )
@@ -521,6 +760,9 @@ def get_tickets(
 @app.get("/dashboard")
 def get_dashboard(
     db: Session = Depends(get_db),
+    current_user: User = Depends(
+        require_roles("support_agent", "admin")
+    ),
 ):
     """
     Return real-time dashboard statistics
@@ -548,11 +790,11 @@ def get_dashboard(
 
     order_statuses = {}
 
-    for status, count in order_status_rows:
+    for order_status_value, count in order_status_rows:
 
         status_name = (
-            status.lower()
-            if status
+            order_status_value.lower()
+            if order_status_value
             else "unknown"
         )
 
@@ -579,11 +821,11 @@ def get_dashboard(
 
     ticket_statuses = {}
 
-    for status, count in ticket_status_rows:
+    for ticket_status_value, count in ticket_status_rows:
 
         status_name = (
-            status.lower()
-            if status
+            ticket_status_value.lower()
+            if ticket_status_value
             else "unknown"
         )
 
@@ -597,7 +839,6 @@ def get_dashboard(
     chunks = load_and_chunk_documents()
 
     total_documents = len(documents)
-
     total_chunks = len(chunks)
 
     # --------------------------------------------------------

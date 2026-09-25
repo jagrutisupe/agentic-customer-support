@@ -71,3 +71,8 @@ desktop.ini
 *.temp
 *.swp
 *.swo
+# Local project backups and archives
+*.zip
+backend_rbac/
+backend/app/agent/*_before_*.py
+backend/app/main_before_*.py

@@ -1,6 +1,12 @@
+import json
 import re
+import time
+from datetime import datetime
 
 from sqlalchemy.orm import Session
+
+from app.agent.decision import make_agent_decision
+from app.database.models import Conversation, Message, AgentLog, SupportTicket
 
 from app.tools.order_tools import get_order_status
 from app.tools.product_tools import (
@@ -13,12 +19,142 @@ from app.tools.ticket_tools import (
 )
 from app.rag.rag_tools import search_knowledge_base
 
+# ============================================================
+# INPUT SCOPE GUARDRAIL
+# ============================================================
+
+def is_customer_support_query(query: str) -> bool:
+    """
+    Determine whether a query is related to the customer-support
+    capabilities of this application.
+
+    This is intentionally rule-based so that unsupported requests
+    are rejected before any database or RAG tool is executed.
+    """
+
+    text = query.lower().strip()
+
+    if not text:
+        return False
+
+    support_keywords = [
+        # Orders
+        "order",
+        "orders",
+        "ord",
+        "delivery",
+        "delivered",
+        "shipping",
+        "shipment",
+        "track",
+        "tracking",
+
+        # Products
+        "product",
+        "products",
+        "price",
+        "cost",
+        "stock",
+        "available",
+        "availability",
+        "buy",
+        "purchase",
+
+        # Returns / refunds
+        "return",
+        "returns",
+        "refund",
+        "refunded",
+        "exchange",
+
+        # Warranty / damage
+        "warranty",
+        "damaged",
+        "damage",
+        "broken",
+        "defective",
+
+        # Cancellation
+        "cancel",
+        "cancelled",
+        "canceled",
+        "cancellation",
+
+        # Support
+        "support",
+        "help",
+        "issue",
+        "problem",
+        "complaint",
+        "ticket",
+        "customer service",
+
+        # Human escalation
+"escalate",
+"escalation",
+"human agent",
+"human support",
+"human representative",
+"representative",
+"speak to a human",
+"speak to human",
+"talk to a human",
+"talk to human",
+"connect me to a human",
+"connect me to an agent",
+"need a human agent",
+"need a human",
+"want to speak to a human",
+"want human support",
+    ]
+
+    return any(
+        keyword in text
+        for keyword in support_keywords
+    )
 
 # ============================================================
 # CONVERSATION MEMORY
 # ============================================================
 
 conversation_memory = {}
+
+
+def get_or_create_conversation(
+    db: Session,
+    customer_id: int | None,
+    session_id: str | None,
+):
+    """
+    Get the persistent Conversation record for a session,
+    or create it when it does not exist.
+    """
+
+    if not customer_id or not session_id:
+        return None
+
+    conversation = (
+        db.query(Conversation)
+        .filter(
+            Conversation.session_id == session_id,
+        )
+        .first()
+    )
+
+    if conversation:
+        return conversation
+
+    conversation = Conversation(
+        customer_id=customer_id,
+        session_id=session_id,
+        status="active",
+    )
+
+    db.add(conversation)
+    db.commit()
+    db.refresh(conversation)
+
+    return conversation
 
 
 def get_memory(session_id: str | None):
@@ -33,6 +169,98 @@ def get_memory(session_id: str | None):
         session_id,
         {},
     )
+
+def save_conversation_messages(
+    db: Session,
+    conversation,
+    query: str,
+    response: str,
+):
+    """Persist the customer query and agent response for a conversation."""
+
+    if conversation is None:
+        return
+
+    db.add(
+        Message(
+            conversation_id=conversation.id,
+            sender="customer",
+            message=query,
+        )
+    )
+
+    if response:
+        db.add(
+            Message(
+                conversation_id=conversation.id,
+                sender="agent",
+                message=response,
+            )
+        )
+
+    conversation.updated_at = datetime.utcnow()
+    db.commit()
+
+
+
+def save_agent_log(
+    db: Session,
+    conversation,
+    query: str,
+    decision: dict | None,
+    agent: str,
+    tool: str | None,
+    result: dict,
+    trace: list[str],
+    response: str,
+    latency_ms: float,
+):
+    """Persist one complete agent execution to PostgreSQL."""
+
+    if conversation is None:
+        return
+
+    last_log = (
+        db.query(AgentLog)
+        .filter(AgentLog.conversation_id == conversation.id)
+        .order_by(AgentLog.iteration.desc())
+        .first()
+    )
+    iteration = (last_log.iteration + 1) if last_log else 1
+
+    success = result.get("success", True)
+
+    log = AgentLog(
+        conversation_id=conversation.id,
+        iteration=iteration,
+        intent=(
+            decision.get("intent")
+            if decision
+            else agent
+        ),
+        action=agent,
+        tool_name=tool,
+        tool_input={
+            "query": query,
+        },
+        tool_output={
+    "result": json.loads(json.dumps(result, default=str)),
+    "response": response,
+    "trace": trace,
+},
+        latency_ms=round(latency_ms, 2),
+        status="success" if success else "failed",
+        escalated=(
+            agent in {
+                "guardrail",
+                "escalation",
+            }
+            or result.get("escalated", False)
+        ),
+    )
+
+    db.add(log)
+    db.commit()
 
 
 def update_memory(
@@ -60,18 +288,43 @@ def build_response(
     *,
     query: str,
     agent: str,
-    tool: str,
+    tool: str | None,
     result: dict,
+    db: Session,
+    conversation=None,
     response: str,
     memory_enabled: bool,
     session_id: str | None,
     customer_id: int | None,
     context_used: bool,
     trace: list[str],
+    decision: dict | None = None,
+    latency_ms: float = 0.0,
 ):
     """
     Standard response structure returned by the agent.
     """
+
+    if conversation is not None:
+        save_conversation_messages(
+            db=db,
+            conversation=conversation,
+            query=query,
+            response=response,
+        )
+
+        save_agent_log(
+            db=db,
+            conversation=conversation,
+            query=query,
+            decision=decision,
+            agent=agent,
+            tool=tool,
+            result=result,
+            trace=trace,
+            response=response,
+            latency_ms=latency_ms,
+        )
 
     return {
         "success": result.get("success", True),
@@ -79,6 +332,7 @@ def build_response(
         "agent": agent,
         "tool": tool,
         "response": response,
+        "decision": decision,
 
         "memory": {
             "enabled": memory_enabled,
@@ -485,12 +739,10 @@ def format_rag_response(
     rag_result: dict,
 ) -> str:
     """
-    Convert retrieved Markdown policy sections into a concise,
-    customer-facing response.
+    Convert RAG results into a focused customer-facing answer.
 
-    The knowledge base is chunked by Markdown headings, so this formatter
-    keeps each heading attached to its own content and removes duplicate
-    or unrelated sections.
+    The retriever may return semantically related chunks. This formatter
+    prevents unrelated policy sections from leaking into the final answer.
     """
     if not rag_result.get("success"):
         return rag_result.get(
@@ -516,42 +768,30 @@ def format_rag_response(
         if not sections:
             cleaned = clean_markdown(content)
             if cleaned:
-                sections = [
-                    {
-                        "heading": "",
-                        "content": cleaned,
-                    }
-                ]
+                sections = [{
+                    "heading": "",
+                    "content": cleaned,
+                }]
 
         for section in sections:
-            heading = clean_markdown(
-                section.get("heading", "")
-            ).strip()
-
-            section_content = clean_markdown(
-                section.get("content", "")
-            ).strip()
+            heading = section.get("heading", "")
+            section_content = section.get("content", "")
 
             if not section_content:
                 continue
 
-            candidate_sections.append(
-                {
-                    "heading": heading,
-                    "content": section_content,
-                    "filename": result.get("filename", ""),
-                    "chunk_id": result.get("chunk_id"),
-                    "distance": result.get("distance"),
-                }
-            )
+            candidate_sections.append({
+                "heading": heading,
+                "content": section_content,
+                "filename": result.get("filename", ""),
+                "distance": result.get("distance"),
+            })
 
     if not candidate_sections:
         return "I couldn't find a relevant answer in the knowledge base."
 
-    # --------------------------------------------------------
-    # Keep only sections relevant to the detected policy.
-    # --------------------------------------------------------
-
+    # Strict intent filtering. If the query clearly asks about one policy,
+    # do not mix in merely related sections from another policy.
     if intent:
         heading_matches = [
             section
@@ -582,11 +822,9 @@ def format_rag_response(
         if filtered:
             candidate_sections = filtered
 
-    # --------------------------------------------------------
-    # Remove duplicate sections.
-    # --------------------------------------------------------
-
+    # Remove exact duplicate sections.
     unique_sections = {}
+
     for section in candidate_sections:
         key = (
             normalize_text(section["heading"]),
@@ -598,25 +836,18 @@ def format_rag_response(
 
     candidate_sections = list(unique_sections.values())
 
-    # --------------------------------------------------------
-    # Prefer the most semantically relevant chunks.
-    # --------------------------------------------------------
-
+    # Prefer sections returned with better vector similarity when available.
     candidate_sections.sort(
         key=lambda item: (
             item.get("distance") is None,
-            (
-                item.get("distance")
-                if item.get("distance") is not None
-                else float("inf")
-            ),
+            item.get("distance") if item.get("distance") is not None else float("inf"),
         )
     )
 
-    # Keep policy answers focused.
+    # Keep the answer focused.
     max_sections = {
         "cancellation": 1,
-        "refund": 2,
+        "refund": 1,
         "return": 3,
         "warranty": 3,
         "shipping": 3,
@@ -625,39 +856,30 @@ def format_rag_response(
 
     candidate_sections = candidate_sections[:max_sections]
 
-    # --------------------------------------------------------
-    # Build readable sections.
-    # --------------------------------------------------------
-
     response_parts = []
 
     for section in candidate_sections:
-        heading = section.get("heading", "").strip()
+        heading = section.get("heading", "")
         content = section.get("content", "").strip()
 
         if not content:
             continue
 
-        # Limit each section to a few complete sentences.
+        # Keep responses concise without cutting useful policy sentences.
         sentences = re.split(
             r"(?<=[.!?])\s+",
             content,
         )
-
         sentences = [
             sentence.strip()
             for sentence in sentences
             if sentence.strip()
         ]
-
-        if len(sentences) > 4:
-            sentences = sentences[:4]
-
-        content = " ".join(sentences).strip()
+        content = " ".join(sentences[:5])
 
         if heading:
             response_parts.append(
-                f"{heading}\n{content}"
+                f"**{heading}**\n\n{content}"
             )
         else:
             response_parts.append(content)
@@ -705,6 +927,7 @@ def route_query(
     supporting contextual follow-up questions.
     """
 
+    start_time = time.perf_counter()
     text = query.lower().strip()
 
     # ========================================================
@@ -712,6 +935,67 @@ def route_query(
     # ========================================================
 
     memory = get_memory(session_id)
+
+    # =============================================
+    # PERSISTENT CONVERSATION
+    # =============================================
+
+    conversation = get_or_create_conversation(
+        db=db,
+        customer_id=customer_id,
+        session_id=session_id,
+    )
+
+    # ========================================================
+    # 0.5 INPUT SCOPE GUARDRAIL
+    # ========================================================
+
+    if not is_customer_support_query(query):
+
+        trace = [
+            "Query received",
+            "Conversation memory checked",
+            "Input scope guardrail evaluated",
+            "Query rejected as out-of-scope",
+            "No controlled tool executed",
+        ]
+
+        response = (
+            "I’m designed to help with customer-support "
+            "requests such as orders, products, delivery, "
+            "returns, refunds, warranties, and support tickets."
+        )
+
+        return build_response(
+            query=query,
+            agent="guardrail",
+            tool=None,
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
+            result={
+                "success": False,
+                "reason": "out_of_scope",
+            },
+            response=response,
+            memory_enabled=True,
+            session_id=session_id,
+            customer_id=customer_id,
+            context_used=False,
+            trace=trace,
+            decision={
+                "intent": "out_of_scope",
+                "confidence": 1.0,
+                "entities": {},
+                "tool": None,
+                "requires_memory": False,
+                "plan": [
+                    "evaluate request scope",
+                    "reject unsupported request",
+                    "generate safe response",
+                ],
+            },
+        )
 
     context_used = False
 
@@ -721,7 +1005,28 @@ def route_query(
     ]
 
     # ========================================================
-    # 0A. CUSTOMER ID MEMORY
+    # 0A. AGENT DECISION / PLANNING
+    # ========================================================
+
+    decision = make_agent_decision(
+        query=query,
+        memory=memory,
+    )
+
+    trace.append(
+        f"Agent decision created: {decision.get('intent')}"
+    )
+
+    trace.append(
+        f"Decision confidence: {decision.get('confidence')}"
+    )
+
+    trace.append(
+        f"Execution plan created: {decision.get('plan')}"
+    )
+
+    # ========================================================
+    # 0B. CUSTOMER ID MEMORY
     # ========================================================
 
     if customer_id is None:
@@ -825,6 +1130,9 @@ def route_query(
             query=query,
             agent="order_status",
             tool="get_order_status",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
             result=order_result,
             response=response,
             memory_enabled=True,
@@ -832,14 +1140,199 @@ def route_query(
             customer_id=customer_id,
             context_used=context_used,
             trace=trace,
+            decision=decision,
         )
 
     # ========================================================
-    # 1. CREATE SUPPORT TICKET
+    # 1. HUMAN ESCALATION
+    # ========================================================
+
+    if decision.get("intent") == "escalation":
+
+        trace.append(
+            "Router selected: escalation"
+        )
+
+        # ----------------------------------------------------
+        # CUSTOMER ID REQUIRED
+        # ----------------------------------------------------
+
+        if customer_id is None:
+
+            result = {
+                "success": False,
+                "message": (
+                    "customer_id is required to escalate "
+                    "this conversation to human support."
+                ),
+                "escalated": False,
+            }
+
+            trace.extend(
+                [
+                    "Controlled tool not executed",
+                    "Validation response generated",
+                ]
+            )
+
+            return build_response(
+                query=query,
+                agent="escalation",
+                tool="create_support_ticket",
+                db=db,
+                conversation=conversation,
+                latency_ms=(time.perf_counter() - start_time) * 1000,
+                result=result,
+                response=result["message"],
+                memory_enabled=True,
+                session_id=session_id,
+                customer_id=customer_id,
+                context_used=False,
+                trace=trace,
+                decision=decision,
+            )
+
+        # ----------------------------------------------------
+        # CREATE HIGH-PRIORITY ESCALATION TICKET
+        # ----------------------------------------------------
+
+        ticket_result = create_support_ticket(
+            db=db,
+            customer_id=customer_id,
+            subject="Human support escalation",
+            description=query,
+            priority="high",
+        )
+
+        trace.extend(
+            [
+                "Controlled tool executed: create_support_ticket",
+                "Tool observation received",
+            ]
+        )
+
+        if ticket_result.get("success"):
+
+            ticket = ticket_result.get(
+                "ticket",
+                {},
+            )
+
+            ticket_id = ticket.get("id")
+
+            # ------------------------------------------------
+            # UPDATE ESCALATION TICKET STATE
+            # ------------------------------------------------
+
+            if ticket_id is not None:
+
+                escalation_ticket = (
+                    db.query(SupportTicket)
+                    .filter(
+                        SupportTicket.id == ticket_id
+                    )
+                    .first()
+                )
+
+                if escalation_ticket:
+
+                    now = datetime.utcnow()
+
+                    escalation_ticket.status = (
+                        "waiting_for_agent"
+                    )
+
+                    escalation_ticket.escalated_at = now
+
+                    escalation_ticket.last_message_at = now
+
+                    db.commit()
+
+                    db.refresh(
+                        escalation_ticket
+                    )
+
+                    ticket["status"] = (
+                        escalation_ticket.status
+                    )
+
+                    ticket["escalated_at"] = (
+                        escalation_ticket.escalated_at
+                    )
+
+                    ticket["last_message_at"] = (
+                        escalation_ticket.last_message_at
+                    )
+
+                    trace.extend(
+                        [
+                            "Escalation ticket status updated to waiting_for_agent",
+                            "Escalation timestamp recorded",
+                            "Last message timestamp recorded",
+                        ]
+                    )
+
+            response = (
+                f"I've escalated your request to human support "
+                f"and created support ticket #{ticket_id}. "
+                f"The ticket is now waiting for a support agent "
+                f"and has high priority."
+            )
+
+            update_memory(
+                session_id,
+                {
+                    "customer_id": customer_id,
+                    "last_agent": "escalation",
+                    "last_tool": "create_support_ticket",
+                    "last_ticket_id": ticket_id,
+                    "last_ticket_status": ticket.get("status"),
+                },
+            )
+
+            ticket_result["escalated"] = True
+
+        else:
+
+            response = ticket_result.get(
+                "message",
+                "I could not create the human-support escalation ticket.",
+            )
+
+            ticket_result["escalated"] = False
+
+        trace.extend(
+            [
+                "Human support escalation recorded",
+                "Final response generated",
+                "Conversation memory updated",
+            ]
+        )
+
+        return build_response(
+            query=query,
+            agent="escalation",
+            tool="create_support_ticket",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
+            result=ticket_result,
+            response=response,
+            memory_enabled=True,
+            session_id=session_id,
+            customer_id=customer_id,
+            context_used=False,
+            trace=trace,
+            decision=decision,
+        )
+
+    # ========================================================
+    # 2. CREATE SUPPORT TICKET
     # ========================================================
 
     if (
-        "create ticket" in text
+        decision.get("intent") == "create_ticket"
+        or "create ticket" in text
         or "create a ticket" in text
         or "support ticket" in text
         or "raise a ticket" in text
@@ -877,6 +1370,9 @@ def route_query(
                 query=query,
                 agent="create_ticket",
                 tool="create_support_ticket",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
                 result=result,
                 response=result["message"],
                 memory_enabled=True,
@@ -884,6 +1380,7 @@ def route_query(
                 customer_id=customer_id,
                 context_used=False,
                 trace=trace,
+                decision=decision,
             )
 
         # ----------------------------------------------------
@@ -958,6 +1455,9 @@ def route_query(
                 query=query,
                 agent="create_ticket",
                 tool="create_support_ticket",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
                 result=result,
                 response=result["message"],
                 memory_enabled=True,
@@ -965,6 +1465,7 @@ def route_query(
                 customer_id=customer_id,
                 context_used=False,
                 trace=trace,
+                decision=decision,
             )
 
         # ----------------------------------------------------
@@ -1050,6 +1551,9 @@ def route_query(
             query=query,
             agent="create_ticket",
             tool="create_support_ticket",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
             result=ticket_result,
             response=response,
             memory_enabled=True,
@@ -1057,6 +1561,7 @@ def route_query(
             customer_id=customer_id,
             context_used=False,
             trace=trace,
+            decision=decision,
         )
 
     # ========================================================
@@ -1064,11 +1569,14 @@ def route_query(
     # ========================================================
 
     if (
-        "ticket" in text
-        and (
+        (decision.get("intent") == "ticket_status")
+        or (
+            "ticket" in text
+            and (
             "status" in text
             or "check ticket" in text
             or "ticket status" in text
+        )
         )
     ):
 
@@ -1124,6 +1632,9 @@ def route_query(
                 query=query,
                 agent="ticket_status",
                 tool="get_ticket_status",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
                 result=result,
                 response=result["message"],
                 memory_enabled=True,
@@ -1131,6 +1642,7 @@ def route_query(
                 customer_id=customer_id,
                 context_used=False,
                 trace=trace,
+                decision=decision,
             )
 
         ticket_result = get_ticket_status(
@@ -1190,6 +1702,9 @@ def route_query(
             query=query,
             agent="ticket_status",
             tool="get_ticket_status",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
             result=ticket_result,
             response=response,
             memory_enabled=True,
@@ -1197,19 +1712,296 @@ def route_query(
             customer_id=customer_id,
             context_used=context_used,
             trace=trace,
+            decision=decision,
         )
+
+    # ========================================================
+    # 3. MULTI-STEP ORDER + POLICY
+    # ========================================================
+
+    if decision.get("intent") == "order_policy":
+
+        trace.append(
+            "Router selected: order_policy"
+        )
+
+        # ----------------------------------------------------
+        # IDENTIFY ORDER
+        # ----------------------------------------------------
+
+        match = re.search(
+            r"\bORD\d+\b",
+            query,
+            re.IGNORECASE,
+        )
+
+        if match:
+
+            order_number = match.group(0).upper()
+
+        elif memory.get("last_order_number"):
+
+            order_number = memory["last_order_number"]
+
+            context_used = True
+
+            trace.append(
+                f"Previous order context found: {order_number}"
+            )
+
+        else:
+
+            result = {
+                "success": False,
+                "message": (
+                    "Please provide your order number, "
+                    "for example ORD1002."
+                ),
+            }
+
+            trace.extend(
+                [
+                    "Controlled tool not executed",
+                    "Validation response generated",
+                ]
+            )
+
+            return build_response(
+                query=query,
+                agent="order_policy",
+                tool="get_order_status",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
+                result=result,
+                response=result["message"],
+                memory_enabled=True,
+                session_id=session_id,
+                customer_id=customer_id,
+                context_used=False,
+                trace=trace,
+                decision=decision,
+            )
+
+        # ----------------------------------------------------
+        # STEP 1: GET ORDER STATUS
+        # ----------------------------------------------------
+
+        order_result = get_order_status(
+            db=db,
+            order_number=order_number,
+        )
+
+        trace.extend(
+            [
+                "Step 1 executed: get_order_status",
+                "Order observation received",
+            ]
+        )
+
+        if not order_result.get("success"):
+
+            response = order_result.get(
+                "message",
+                "I could not retrieve the order details.",
+            )
+
+            trace.append(
+                "Multi-step execution stopped: order lookup failed"
+            )
+
+            return build_response(
+                query=query,
+                agent="order_policy",
+                tool="get_order_status",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
+                result=order_result,
+                response=response,
+                memory_enabled=True,
+                session_id=session_id,
+                customer_id=customer_id,
+                context_used=context_used,
+                trace=trace,
+                decision=decision,
+            )
+
+        # ----------------------------------------------------
+        # STEP 2: RETRIEVE RELEVANT POLICY
+        # ----------------------------------------------------
+
+        policy_query = (
+            "What should a customer do if an order has "
+            "passed its expected delivery date or is delayed?"
+        )
+
+        rag_result = search_knowledge_base(
+            query=policy_query,
+            top_k=3,
+        )
+
+        trace.extend(
+            [
+                "Step 2 executed: search_knowledge_base",
+                "Policy observation received",
+            ]
+        )
+
+        # ----------------------------------------------------
+        # STEP 3: EXTRACT ORDER INFORMATION
+        # ----------------------------------------------------
+
+        order = order_result.get(
+            "order",
+            {},
+        )
+
+        status = order.get(
+            "status",
+            "unknown",
+        )
+
+        expected_delivery = order.get(
+            "expected_delivery",
+        )
+
+        # ----------------------------------------------------
+        # STEP 4: DETERMINE WHETHER DELIVERY IS DELAYED
+        # ----------------------------------------------------
+
+        from datetime import datetime
+
+        is_delayed = False
+
+        if expected_delivery:
+
+            try:
+
+                if isinstance(
+                    expected_delivery,
+                    str,
+                ):
+                    delivery_date = datetime.fromisoformat(
+                        expected_delivery.replace(
+                            "Z",
+                            "",
+                        )
+                    )
+
+                else:
+
+                    delivery_date = expected_delivery
+
+                is_delayed = (
+                    delivery_date < datetime.now()
+                )
+
+            except (
+                ValueError,
+                TypeError,
+            ):
+                is_delayed = False
+
+        trace.append(
+            f"Order delay evaluation completed: delayed={is_delayed}"
+        )
+
+        # ----------------------------------------------------
+        # STEP 5: GENERATE COMBINED RESPONSE
+        # ----------------------------------------------------
+
+        if is_delayed:
+
+            response = (
+                f"Order {order_number} is currently "
+                f"{status}. Its expected delivery date was "
+                f"{expected_delivery}, which has passed. "
+                f"Based on the support policy, customers "
+                f"should contact customer support when an "
+                f"order has passed its expected delivery date."
+            )
+
+        else:
+
+            response = (
+                f"Order {order_number} is currently "
+                f"{status}. The expected delivery date is "
+                f"{expected_delivery}. Based on the available "
+                f"order information, the order has not been "
+                f"identified as delayed."
+            )
+
+        trace.extend(
+            [
+                "Order data combined with policy information",
+                "Final response generated",
+            ]
+        )
+
+        # ----------------------------------------------------
+        # SAVE ORDER MEMORY
+        # ----------------------------------------------------
+
+        update_memory(
+            session_id,
+            {
+                "customer_id": customer_id,
+                "last_agent": "order_policy",
+                "last_tool": "get_order_status",
+                "last_order_number": order_number,
+                "last_order_status": status,
+                "last_expected_delivery": expected_delivery,
+            },
+        )
+
+        trace.append(
+            "Conversation memory updated"
+        )
+
+        # ----------------------------------------------------
+        # RETURN MULTI-STEP RESULT
+        # ----------------------------------------------------
+
+        combined_result = {
+            "success": True,
+            "order": order,
+            "policy": rag_result,
+            "is_delayed": is_delayed,
+        }
+
+        return build_response(
+            query=query,
+            agent="order_policy",
+            tool="get_order_status + search_knowledge_base",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
+            result=combined_result,
+            response=response,
+            memory_enabled=True,
+            session_id=session_id,
+            customer_id=customer_id,
+            context_used=context_used,
+            trace=trace,
+            decision=decision,
+        )
+
 
     # ========================================================
     # 3. ORDER STATUS / TRACKING
     # ========================================================
 
     if (
-        "order" in text
-        and (
+        (decision.get("intent") == "order_status")
+        or (
+            "order" in text
+            and (
             "status" in text
             or "where" in text
             or "track" in text
             or "delivery" in text
+        )
         )
     ):
 
@@ -1266,6 +2058,9 @@ def route_query(
                 query=query,
                 agent="order_status",
                 tool="get_order_status",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
                 result=result,
                 response=result["message"],
                 memory_enabled=True,
@@ -1273,6 +2068,7 @@ def route_query(
                 customer_id=customer_id,
                 context_used=False,
                 trace=trace,
+                decision=decision,
             )
 
         order_result = get_order_status(
@@ -1329,6 +2125,9 @@ def route_query(
             query=query,
             agent="order_status",
             tool="get_order_status",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
             result=order_result,
             response=response,
             memory_enabled=True,
@@ -1336,6 +2135,7 @@ def route_query(
             customer_id=customer_id,
             context_used=context_used,
             trace=trace,
+            decision=decision,
         )
 
     # ========================================================
@@ -1343,7 +2143,8 @@ def route_query(
     # ========================================================
 
     if (
-        "product details" in text
+        decision.get("intent") == "product_details"
+        or "product details" in text
         or "details of product" in text
         or "product information" in text
     ):
@@ -1395,6 +2196,9 @@ def route_query(
                 query=query,
                 agent="product_details",
                 tool="get_product_details",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
                 result=result,
                 response=result["message"],
                 memory_enabled=True,
@@ -1402,6 +2206,7 @@ def route_query(
                 customer_id=customer_id,
                 context_used=False,
                 trace=trace,
+                decision=decision,
             )
 
         product_result = get_product_details(
@@ -1443,6 +2248,9 @@ def route_query(
             query=query,
             agent="product_details",
             tool="get_product_details",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
             result=product_result,
             response=response,
             memory_enabled=True,
@@ -1450,6 +2258,7 @@ def route_query(
             customer_id=customer_id,
             context_used=context_used,
             trace=trace,
+            decision=decision,
         )
 
     # ========================================================
@@ -1475,9 +2284,12 @@ def route_query(
         "support",
     ]
 
-    if any(
-        keyword in text
-        for keyword in rag_keywords
+    if (
+        decision.get("intent") != "product_search"
+        and any(
+            keyword in text
+            for keyword in rag_keywords
+        )
     ):
 
         trace.append(
@@ -1528,6 +2340,9 @@ def route_query(
             query=query,
             agent="rag",
             tool="search_knowledge_base",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
             result=rag_result,
             response=response,
             memory_enabled=True,
@@ -1535,190 +2350,72 @@ def route_query(
             customer_id=customer_id,
             context_used=False,
             trace=trace,
+            decision=decision,
         )
 
-        # ========================================================
+    # ========================================================
     # 6. PRODUCT SEARCH
     # ========================================================
 
-    # Product names / categories commonly present in the
-    # customer-support product catalog.
     product_keywords = [
-        # Computing
-        "keyboard",
-        "keyboards",
-        "mouse",
-        "mice",
-        "laptop",
-        "laptops",
-        "monitor",
-        "monitors",
-        "webcam",
-        "webcams",
-
-        # Audio
-        "headphone",
-        "headphones",
-        "earphone",
-        "earphones",
-        "earbuds",
-        "speaker",
-        "speakers",
-
-        # Mobile / accessories
-        "phone",
-        "phones",
-        "smartphone",
-        "smartphones",
-        "tablet",
-        "tablets",
-        "charger",
-        "chargers",
-        "cable",
-        "cables",
-        "adapter",
-        "adapters",
-        "hub",
-        "hubs",
-        "usb",
-        "usb-c",
-        "usb c",
-        "type-c",
-        "type c",
-        "power bank",
-        "powerbank",
-
-        # Wearables
-        "watch",
-        "watches",
-        "smartwatch",
-        "smartwatches",
-        "wearable",
-        "wearables",
-
-        # Other electronics
-        "camera",
-        "cameras",
-        "printer",
-        "printers",
-        "router",
-        "routers",
-        "ssd",
-        "hard drive",
-        "hard drives",
-        "storage",
+        "keyboard", "keyboards",
+        "mouse", "mice",
+        "laptop", "laptops",
+        "monitor", "monitors",
+        "webcam", "webcams",
+        "headphone", "headphones",
+        "earphone", "earphones", "earbuds",
+        "speaker", "speakers",
+        "phone", "phones", "smartphone", "smartphones",
+        "tablet", "tablets",
+        "charger", "chargers",
+        "cable", "cables",
+        "adapter", "adapters",
+        "hub", "hubs", "usb", "usb-c", "usb c",
+        "type-c", "type c",
+        "power bank", "powerbank",
+        "watch", "watches", "smartwatch", "smartwatches",
+        "wearable", "wearables",
+        "camera", "cameras",
+        "printer", "printers",
+        "router", "routers",
+        "ssd", "hard drive", "hard drives", "storage",
     ]
 
-    # Natural-language phrases that indicate the customer
-    # is looking for / checking availability of a product.
-    product_intent_phrases = [
-        "do you have",
-        "do you sell",
-        "is there",
-        "is there any",
-        "are there",
-        "can i buy",
-        "i want",
-        "i need",
-        "looking for",
-        "looking to buy",
-        "find me",
-        "show me",
-        "available",
-        "availability",
-        "in stock",
-        "stock available",
-        "what products",
-        "which products",
-        "what devices",
-        "how much is",
-        "how much does",
-        "what is the price",
-        "price of",
-        "cost of",
-    ]
-
-    # Detect an explicit product/category.
-    matched_product_keyword = next(
-        (
-            keyword
-            for keyword in product_keywords
-            if keyword in text
-        ),
-        None,
-    )
-
-    # Detect a shopping/product-search style request.
-    matched_product_intent = any(
-        phrase in text
-        for phrase in product_intent_phrases
-    )
-
-    # A product search should be routed here when either:
-    # 1. A known product/category is mentioned, OR
-    # 2. The query clearly sounds like a product lookup.
-    #
-    # This must remain BEFORE the DEFAULT → RAG route.
+    # The decision layer is authoritative for product-search intent.
+    # Keyword matching remains as a backward-compatible fallback.
     if (
-        matched_product_keyword
-        or matched_product_intent
+        decision.get("intent") == "product_search"
+        or any(keyword in text for keyword in product_keywords)
     ):
 
         trace.append(
             "Router selected: product_search"
         )
 
-        # ----------------------------------------------------
-        # BUILD A CLEAN SEARCH QUERY
-        # ----------------------------------------------------
+        search_query = query.strip()
 
-        # Prefer the actual product/category keyword when one
-        # is detected. This gives search_products() a much
-        # cleaner database query.
-        if matched_product_keyword:
-            search_query = matched_product_keyword
-        else:
-            search_query = query.strip()
-
-        # Normalize common USB-C wording so that:
-        # "USB-C hub"
-        # "USB C hub"
-        # "type-c hub"
-        # can all search the same catalog terms.
-        normalized_search_query = (
-            search_query
-            .lower()
+        # Prefer a specific catalog keyword when one is present.
+        # Keep multi-word USB-C hub requests intact.
+        normalized_query = (
+            search_query.lower()
             .replace("usb c", "usb-c")
             .replace("type c", "type-c")
         )
 
-        # If the query contains both a specific product name
-        # and "usb", keep the complete useful phrase.
-        if (
-            "usb-c" in normalized_search_query
-            and "hub" in normalized_search_query
-        ):
+        if "usb-c" in normalized_query and "hub" in normalized_query:
             search_query = "USB-C hub"
-
-        elif (
-            "usb" in normalized_search_query
-            and "hub" in normalized_search_query
-        ):
+        elif "type-c" in normalized_query and "hub" in normalized_query:
             search_query = "USB-C hub"
-
-        elif (
-            "type-c" in normalized_search_query
-            and "hub" in normalized_search_query
-        ):
-            search_query = "USB-C hub"
+        else:
+            for keyword in product_keywords:
+                if keyword in text:
+                    search_query = keyword
+                    break
 
         trace.append(
             f"Product search query: {search_query}"
         )
-
-        # ----------------------------------------------------
-        # EXECUTE CONTROLLED PRODUCT TOOL
-        # ----------------------------------------------------
 
         product_result = search_products(
             db=db,
@@ -1745,27 +2442,19 @@ def route_query(
 
             if products:
 
-                response_lines = [
+                response = "\n".join(
                     (
-                        f"• {product.get('name')} — "
+                        f"{product.get('name')} — "
                         f"₹{product.get('price')} "
                         f"(Stock: {product.get('stock')})"
                     )
                     for product in products
-                ]
-
-                response = (
-                    f"I found {len(products)} "
-                    f"matching product"
-                    f"{'s' if len(products) != 1 else ''}:\n"
-                    + "\n".join(response_lines)
                 )
 
             else:
 
                 response = (
-                    f"I couldn't find any products "
-                    f"matching \"{search_query}\"."
+                    "I couldn't find any matching products."
                 )
 
         else:
@@ -1776,7 +2465,7 @@ def route_query(
             )
 
         # ----------------------------------------------------
-        # SAVE PRODUCT SEARCH MEMORY
+        # MEMORY
         # ----------------------------------------------------
 
         update_memory(
@@ -1800,6 +2489,9 @@ def route_query(
             query=query,
             agent="product_search",
             tool="search_products",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
             result=product_result,
             response=response,
             memory_enabled=True,
@@ -1807,6 +2499,7 @@ def route_query(
             customer_id=customer_id,
             context_used=False,
             trace=trace,
+            decision=decision,
         )
 
     # ========================================================
@@ -1857,6 +2550,9 @@ def route_query(
         query=query,
         agent="rag",
         tool="search_knowledge_base",
+            db=db,
+            conversation=conversation,
+            latency_ms=(time.perf_counter() - start_time) * 1000,
         result=rag_result,
         response=response,
         memory_enabled=True,
@@ -1864,4 +2560,5 @@ def route_query(
         customer_id=customer_id,
         context_used=False,
         trace=trace,
+            decision=decision,
     )
